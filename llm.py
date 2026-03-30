@@ -46,7 +46,6 @@ def _get_provider():
     default_name = _config["default"]
     return _config["providers"][default_name]
 
-
 def _is_minimax_provider(provider):
     """Check if the provider is MiniMax based on api_base URL."""
     api_base = provider.get("api_base", "")
@@ -64,6 +63,7 @@ def _strip_think_tags(text):
         return text
     import re
     return re.sub(r"<think>[\s\S]*?</think>\s*", "", text).strip()
+
 
 
 def _call_llm(messages, tool_defs):
@@ -94,18 +94,43 @@ def _call_llm(messages, tool_defs):
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers)
     timeout = provider.get("timeout", 120)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        # Read response body for debugging 400/422 errors
-        body_text = ""
+    max_retries = provider.get("max_retries", 2)
+    result = None
+    last_exc = None
+    for attempt in range(max_retries + 1):
         try:
-            body_text = e.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            pass
-        log.error("[llm] HTTP %d: %s" % (e.code, body_text))
-        raise
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read())
+            last_exc = None
+            break
+        except urllib.error.HTTPError as e:
+            body_text = ""
+            try:
+                body_text = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            log.error("[llm] HTTP %d: %s" % (e.code, body_text))
+            raise
+        except (TimeoutError, OSError) as e:
+            last_exc = e
+            log.error(
+                f"[llm] Network error on attempt {attempt + 1}/{max_retries + 1}: "
+                f"{type(e).__name__}: {e} | "
+                f"url={url} | "
+                f"model={body.get('model', '?')} | "
+                f"timeout={timeout}s | "
+                f"prompt_tokens~={sum(len(str(m.get('content',''))) for m in body.get('messages', []))} chars"
+            )
+            if attempt < max_retries:
+                wait = 5 * (attempt + 1)
+                log.warning(f"[llm] Retrying in {wait}s...")
+                import time as _time
+                _time.sleep(wait)
+            else:
+                log.error(f"[llm] All {max_retries + 1} attempts failed for {url}")
+    if last_exc:
+        raise last_exc
 
     # Strip think tags from MiniMax M2.5/M2.7 responses
     if _is_minimax_provider(provider):
@@ -117,7 +142,6 @@ def _call_llm(messages, tool_defs):
             pass
 
     return result
-
 
 # ============================================================
 #  Session Management
