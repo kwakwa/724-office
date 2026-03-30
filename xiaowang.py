@@ -40,6 +40,7 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 
 OWNER_IDS = set(str(x) for x in CONFIG.get("owner_ids", []))
 WORKSPACE = os.path.abspath(CONFIG.get("workspace", "./workspace"))
+HOST = CONFIG.get("host","127.0.0.1")
 PORT = CONFIG.get("port", 8080)
 DEBOUNCE_SECONDS = CONFIG.get("debounce_seconds", 3.0)
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
@@ -614,7 +615,7 @@ def main():
 
     messaging.start_gateway(handle_callback)
 
-    log.info(f"[agent] starting on port {PORT}")
+    log.info(f"[agent] starting on {HOST}:{PORT}")
     log.info(f"[agent] workspace={WORKSPACE}")
     log.info(f"[agent] owners={OWNER_IDS}")
     log.info(f"[agent] model={CONFIG['models']['default']}")
@@ -626,8 +627,7 @@ def main():
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
-#    server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
-    server = ThreadedHTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadedHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
