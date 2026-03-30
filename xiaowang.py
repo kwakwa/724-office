@@ -40,7 +40,6 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 
 OWNER_IDS = set(str(x) for x in CONFIG.get("owner_ids", []))
 WORKSPACE = os.path.abspath(CONFIG.get("workspace", "./workspace"))
-HOST = CONFIG.get("host","127.0.0.1")
 PORT = CONFIG.get("port", 8080)
 DEBOUNCE_SECONDS = CONFIG.get("debounce_seconds", 3.0)
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
@@ -325,11 +324,14 @@ def _debounce_flush(sender_id):
     # 合并文本和image
     texts = []
     images = []
+    auth_id = sender_id  # fallback
     for frag in fragments:
         if isinstance(frag, dict):
             if frag.get("text"):
                 texts.append(frag["text"])
             images.extend(frag.get("images", []))
+            if frag.get("auth_id"):
+                auth_id = frag["auth_id"]
         else:
             texts.append(str(frag))
 
@@ -338,16 +340,16 @@ def _debounce_flush(sender_id):
         log.info(f"[debounce] {sender_id}: merged {len(fragments)} messages")
 
     try:
-        if str(sender_id) not in OWNER_IDS:
+        if str(auth_id) not in OWNER_IDS:
             messaging.send_text(sender_id, "Sorry, this agent is currently in single-user mode.")
             return
 
-        log.info(f"[chat] {sender_id} -> tool use loop (images={len(images)})")
-        session_key = f"dm_{sender_id}"
+        log.info(f"[chat] {auth_id} -> tool use loop (images={len(images)})")
+        session_key = f"dm_{auth_id}"
         reply = llm.chat(combined_text, session_key, images=images)
 
         if not reply or not reply.strip():
-            log.warning(f"[chat] empty reply for {sender_id}")
+            log.warning(f"[chat] empty reply for {auth_id}")
             return
 
         for i, chunk in enumerate(split_message(reply, 1800)):
@@ -363,9 +365,9 @@ def _debounce_flush(sender_id):
             pass
 
 
-def debounce_message(sender_id, text, images=None):
+def debounce_message(sender_id, text, images=None, auth_id=None):
     with _debounce_lock:
-        frag = {"text": text, "images": images or []}
+        frag = {"text": text, "images": images or [], "auth_id": auth_id or sender_id}
         _debounce_buffers.setdefault(sender_id, []).append(frag)
         old_timer = _debounce_timers.get(sender_id)
         if old_timer:
@@ -400,10 +402,17 @@ def _download_media(msg_data, media_type="file"):
     ft_map = {"image": 1, "GIF": 1, "video": 4, "voice": 5, "file": 5}
     file_type = ft_map.get(media_type, 5)
 
-    # Path 1: Enterprise format (has fileId)
+    # Path 1: Enterprise format (has fileId + aes key)
     if file_id and file_aes_key:
         log.info(f"[media] trying wxWorkDownload (fileId={file_id[:20]}..., fileType={file_type})")
         path = messaging.download_enterprise(file_id, file_aes_key, file_size, file_type=file_type)
+        if path:
+            return path
+
+    # Path 1b: Discord CDN — fileId is a direct HTTPS URL, no aes key needed
+    if file_id and file_id.startswith("http") and not file_aes_key:
+        log.info(f"[media] trying Discord CDN download (fileId={file_id[:60]}...)")
+        path = messaging.download_enterprise(file_id, "", file_size, file_type=file_type)
         if path:
             return path
 
@@ -433,9 +442,10 @@ def _download_media(msg_data, media_type="file"):
     return None
 
 
-def _handle_media_message(sender_id, msg_data, media_type, filename=""):
+def _handle_media_message(sender_id, msg_data, media_type, filename="", auth_id=None):
     """Handle received multimedia: download, persist, inform LLM"""
-    if str(sender_id) not in OWNER_IDS:
+    auth_id = auth_id or sender_id
+    if str(auth_id) not in OWNER_IDS:
         messaging.send_text(sender_id, "Sorry, this agent is currently in single-user mode.")
         return
 
@@ -462,12 +472,13 @@ def _handle_media_message(sender_id, msg_data, media_type, filename=""):
     else:
         desc_parts.append("(file download failed)")
 
-    debounce_message(sender_id, "\n".join(desc_parts), images=image_paths)
+    debounce_message(sender_id, "\n".join(desc_parts), images=image_paths, auth_id=auth_id)
 
 
-def _handle_voice_message(sender_id, msg_data):
+def _handle_voice_message(sender_id, msg_data, auth_id=None):
     """处理voice消息：下载 → ffmpeg → ASR -> text"""
-    if str(sender_id) not in OWNER_IDS:
+    auth_id = auth_id or sender_id
+    if str(auth_id) not in OWNER_IDS:
         messaging.send_text(sender_id, "Sorry, this agent is currently in single-user mode.")
         return
 
@@ -482,9 +493,9 @@ def _handle_voice_message(sender_id, msg_data):
     # Attempt ASR
     text = asr_recognize(saved_path)
     if text:
-        debounce_message(sender_id, f"[Voice-to-text] {text}")
+        debounce_message(sender_id, f"[Voice-to-text] {text}", auth_id=auth_id)
     else:
-        debounce_message(sender_id, f"[User sent voice message, ASR failed]\nSaved to: {saved_path}")
+        debounce_message(sender_id, f"[User sent voice message, ASR failed]\nSaved to: {saved_path}", auth_id=auth_id)
 
 
 def handle_callback(data):
@@ -505,11 +516,14 @@ def handle_callback(data):
             continue
 
         cmd = msg.get("cmd")
-        sender_id = msg.get("senderId")
+        sender_id = msg.get("senderId")  # channel_id for Discord (reply target)
         msg_type = msg.get("msgType")
         msg_data = msg.get("msgData", {})
         if not isinstance(msg_data, dict):
             msg_data = {}
+
+        # Discord: discordUserId is the actual user ID for auth; sender_id is the channel
+        auth_id = msg_data.get("discordUserId", sender_id)
 
         # Skip messages sent by self
         if str(sender_id) == str(msg.get("userId")):
@@ -519,35 +533,35 @@ def handle_callback(data):
             if msg_type in (0, 2):
                 content = msg_data.get("content", "")
                 if content:
-                    log.info(f"[callback] text from {sender_id}: {content[:100]}")
-                    debounce_message(sender_id, content)
+                    log.info(f"[callback] text from {auth_id} in {sender_id}: {content[:100]}")
+                    debounce_message(sender_id, content, auth_id=auth_id)
             elif msg_type in (7, 14, 101):
-                log.info(f"[callback] image from {sender_id}")
-                _handle_media_message(sender_id, msg_data, "image")
+                log.info(f"[callback] image from {auth_id} in {sender_id}")
+                _handle_media_message(sender_id, msg_data, "image", auth_id=auth_id)
             elif msg_type in (22, 23, 103):
-                log.info(f"[callback] video from {sender_id}")
-                _handle_media_message(sender_id, msg_data, "video")
+                log.info(f"[callback] video from {auth_id} in {sender_id}")
+                _handle_media_message(sender_id, msg_data, "video", auth_id=auth_id)
             elif msg_type in (15, 20, 102):
                 filename = msg_data.get("filename", msg_data.get("fileName", "unknown"))
-                log.info(f"[callback] file from {sender_id}: {filename}")
-                _handle_media_message(sender_id, msg_data, "file", filename)
+                log.info(f"[callback] file from {auth_id} in {sender_id}: {filename}")
+                _handle_media_message(sender_id, msg_data, "file", filename, auth_id=auth_id)
             elif msg_type in (29, 104):
-                log.info(f"[callback] gif from {sender_id}")
-                _handle_media_message(sender_id, msg_data, "GIF")
+                log.info(f"[callback] gif from {auth_id} in {sender_id}")
+                _handle_media_message(sender_id, msg_data, "GIF", auth_id=auth_id)
             elif msg_type == 16:
-                log.info(f"[callback] voice from {sender_id}")
-                _handle_voice_message(sender_id, msg_data)
+                log.info(f"[callback] voice from {auth_id} in {sender_id}")
+                _handle_voice_message(sender_id, msg_data, auth_id=auth_id)
             elif msg_type == 13:
                 title = msg_data.get("title", "")
                 url = msg_data.get("linkUrl", msg_data.get("url", ""))
-                log.info(f"[callback] link from {sender_id}: {title}")
-                debounce_message(sender_id, f"[User shared a link]\nTitle: {title}\nURL: {url}")
+                log.info(f"[callback] link from {auth_id} in {sender_id}: {title}")
+                debounce_message(sender_id, f"[User shared a link]\nTitle: {title}\nURL: {url}", auth_id=auth_id)
             elif msg_type == 6:
                 label = msg_data.get("label", msg_data.get("poiname", ""))
-                log.info(f"[callback] location from {sender_id}: {label}")
-                debounce_message(sender_id, f"[User sent location: {label}]")
+                log.info(f"[callback] location from {auth_id} in {sender_id}: {label}")
+                debounce_message(sender_id, f"[User sent location: {label}]", auth_id=auth_id)
             else:
-                log.info(f"[callback] msgType={msg_type} from {sender_id}")
+                log.info(f"[callback] msgType={msg_type} from {auth_id} in {sender_id}")
         elif cmd == 15500:
             log.info(f"[callback] sys cmd=15500 type={msg_type}")
         elif cmd == 11016:
@@ -597,8 +611,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     scheduler.start()
+
     messaging.start_gateway(handle_callback)
-    log.info(f"[agent] starting on {HOST}:{PORT}")
+
+    log.info(f"[agent] starting on port {PORT}")
     log.info(f"[agent] workspace={WORKSPACE}")
     log.info(f"[agent] owners={OWNER_IDS}")
     log.info(f"[agent] model={CONFIG['models']['default']}")
@@ -610,7 +626,8 @@ def main():
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
-    server = ThreadedHTTPServer((HOST, PORT), Handler)
+#    server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadedHTTPServer(("127.0.0.1", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
