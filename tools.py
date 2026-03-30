@@ -548,7 +548,7 @@ def _load_plugins():
 def _tavily_search(query, count=5):
     """Tavily API search - high quality for English content, returns summaries and links"""
     api_key = _extra_config.get("tavily_api_key", "")
-    if not api_key:
+    if not api_key or api_key.startswith("YOUR_"):
         return "[error] Tavily API key not configured"
 
     url = "https://api.tavily.com/search"
@@ -589,33 +589,27 @@ def _tavily_search(query, count=5):
 
 
 def _web_search(query, count=5):
-    """General web search API"""
-    api_key = _extra_config.get("search_api_key", "")
-    if not api_key:
-        return "[error] Search API key not configured"
-
-    url = "https://api.search-provider.example.com/v1/web-search"
-    body = json.dumps({"query": query, "count": count, "summary": True}).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    })
+    """DuckDuckGo search - free, no API key required."""
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        return f"[error] Web search failed: {e}"
+        from ddgs import DDGS
+    except ImportError:
+        return "[error] ddgs package not installed (pip install ddgs)"
 
-    results = []
-    web_pages = data.get("data", {}).get("webPages", {}).get("value", [])
-    if not web_pages:
+    try:
+        results = list(DDGS().text(query, max_results=count))
+    except Exception as e:
+        return f"[error] DuckDuckGo search failed: {e}"
+
+    if not results:
         return "No relevant results found."
-    for i, item in enumerate(web_pages[:count], 1):
-        title = item.get("name", "")
-        snippet = item.get("summary", item.get("snippet", ""))
-        link = item.get("url", "")
-        results.append(f"{i}. {title}\n   {snippet}\n   Link: {link}")
-    return "\n\n".join(results)
+
+    lines = []
+    for i, item in enumerate(results, 1):
+        title = item.get("title", "")
+        body = item.get("body", "")[:300]
+        link = item.get("href", "")
+        lines.append(f"{i}. {title}\n   {body}\n   Link: {link}")
+    return "\n\n".join(lines)
 
 
 def _github_search(query, count=5):
