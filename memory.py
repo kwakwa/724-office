@@ -279,6 +279,12 @@ def _call_compress_llm(prompt):
     if not content:
         return []
 
+    # Strip <think>...</think> reasoning tags (MiniMax M2.5/M2.7)
+    import re
+    content = re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
+    if not content:
+        return []
+    
     # Extract JSON array from content
     # LLM may wrap in ```json, need to clean
     text = content.strip()
